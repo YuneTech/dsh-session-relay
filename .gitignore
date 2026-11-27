@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# npm pack output and test coverage
+/dsh-session-relay-*.tgz
+/coverage/
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.log
+
+# Local editor and OS files
+/.idea/
+.DS_Store
+Thumbs.db
+*.lock
+package-lock.json

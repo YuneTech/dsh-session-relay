@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "Session Relay",
+    "description": "Summarize history and continue in a fresh session before a configurable model-reply threshold. Retains old conversations and pending input. Defaults to 90 replies, with optional auto-resume and navigation."
+  },
+  "enabled": "Enable automatic relay",
+  "threshold": "Model reply threshold",
+  "autoContinue": "Resume unfinished tasks",
+  "autoSwitch": "Open the new session automatically"
+}

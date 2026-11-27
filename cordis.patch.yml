@@ -1,0 +1,8 @@
+- insert:
+    - id: session-relay
+      name: dsh-session-relay
+      config:
+        enabled: false
+        threshold: 90
+        autoContinue: true
+        autoSwitch: true
