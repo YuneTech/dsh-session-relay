@@ -4,6 +4,7 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
     const settingKeys = ['enabled', 'threshold', 'modelFilter', 'autoContinue', 'autoSwitch'];
+    const modelTokens = value => String(value ?? '').split(/[,，\r\n]+/).map(item => item.trim()).filter(Boolean);
     const settingsDraft = value => ({
       enabled: value.enabled,
       threshold: String(value.threshold),
@@ -21,7 +22,9 @@ window.__ModuleLoader__.load({
       zh: {
         title: '会话接力', on: '已开启', off: '未开启', replies: '次模型回复', settings: '设置',
         enabled: '启用自动接力', threshold: '模型回复次数阈值',
-        modelFilter: '触发接力的模型', modelFilterHint: '填写模型 ID 或 provider/model，用换行或逗号分隔。留空匹配全部模型。',
+        modelFilter: '触发接力的模型', modelFilterHint: '不限模型，或至少勾选一个。', selectAllModels: '不限模型', loadingModels: '正在加载模型目录…',
+        loadModelsError: '无法读取模型目录', retryModels: '重新加载模型', partialModels: '未能加载部分供应商',
+        noModels: '当前没有可用模型', unavailableModels: '已保留当前目录未列出的筛选项',
         autoContinue: '自动继续未完成的任务', autoSwitch: '接力后自动打开新会话', save: '保存', saving: '保存中…',
         saved: '已保存', loadingSettings: '正在读取设置…', loadSettingsError: '无法读取设置', saveSettingsError: '无法保存设置',
         refresh: '刷新状态', retryLoad: '重试读取状态', open: '打开新会话', retry: '重试续接', release: '停用并恢复未转移输入',
@@ -34,7 +37,9 @@ window.__ModuleLoader__.load({
       en: {
         title: 'Session Relay', on: 'On', off: 'Off', replies: 'model replies', settings: 'Settings',
         enabled: 'Enable automatic relay', threshold: 'Model reply threshold',
-        modelFilter: 'Models that trigger relay', modelFilterHint: 'Enter model IDs or provider/model, separated by newlines or commas. Leave blank to match all models.',
+        modelFilter: 'Models that trigger relay', modelFilterHint: 'Allow all models, or check at least one.', selectAllModels: 'Allow all models', loadingModels: 'Loading model catalog…',
+        loadModelsError: 'Could not load model catalog', retryModels: 'Reload models', partialModels: 'Some providers could not be loaded',
+        noModels: 'No available models', unavailableModels: 'Saved filters not listed in the current catalog were kept',
         autoContinue: 'Resume unfinished tasks', autoSwitch: 'Open the new session after relay', save: 'Save', saving: 'Saving…',
         saved: 'Saved', loadingSettings: 'Loading settings…', loadSettingsError: 'Could not load settings', saveSettingsError: 'Could not save settings',
         refresh: 'Refresh status', retryLoad: 'Retry loading status', open: 'Open new session', retry: 'Retry handoff', release: 'Disable and restore untransferred input',
@@ -46,7 +51,7 @@ window.__ModuleLoader__.load({
       },
     };
     return {
-      inject: ['slots', 'sessions', 'uiWorkspace', 'locale', 'remote', 'remote.commands'],
+      inject: ['slots', 'sessions', 'uiWorkspace', 'locale', 'remote', 'remote.commands', 'remote.session'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register('session-relay', words));
         const t = ctx.locale.bind('session-relay');
@@ -80,16 +85,91 @@ window.__ModuleLoader__.load({
             :is(.sr-settings,.sr-panel) .sr-number input{width:104px}
             :is(.sr-settings,.sr-panel) .sr-model{display:grid;gap:6px;margin:8px 0 4px}
             :is(.sr-settings,.sr-panel) .sr-model p{margin:0}
-            :is(.sr-settings,.sr-panel) :is(button,input[type=number],textarea){font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:8px 10px;min-height:44px;box-sizing:border-box}
-            :is(.sr-settings,.sr-panel) textarea{resize:vertical;width:100%;max-width:100%;min-height:72px}
+            .sr-model-list{max-height:280px;overflow:auto;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:6px 10px}
+            .sr-model-list fieldset{border:0;border-bottom:1px solid var(--dsw-alias-border-l1);padding:4px 0 8px;margin:0;min-inline-size:0}
+            .sr-model-feedback{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+            .sr-model-list fieldset:last-child{border-bottom:0}.sr-model-list legend{font-weight:600;padding:4px 0}
+            .sr-model-list .sr-model-option{display:flex;align-items:center;gap:8px;min-height:44px;overflow-wrap:anywhere}
+            .sr-model-list input{width:16px;height:16px;flex:none;accent-color:var(--dsw-alias-brand-primary)}
+            :is(.sr-settings,.sr-panel) :is(button,input[type=number]){font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:8px 10px;min-height:44px;box-sizing:border-box}
             :is(.sr-settings,.sr-panel) button{cursor:pointer}
             :is(.sr-settings,.sr-panel) button:disabled{cursor:default;opacity:.6}
             :is(.sr-settings,.sr-panel) button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
-            :is(.sr-settings,.sr-panel) :is(button,input,textarea):focus-visible{outline:2px solid var(--dsw-focus-ring-color);outline-offset:2px}
+            :is(.sr-settings,.sr-panel) :is(button,input):focus-visible{outline:2px solid var(--dsw-focus-ring-color);outline-offset:2px}
             :is(.sr-settings,.sr-panel) .sr-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
             :is(.sr-settings,.sr-panel) .sr-error{color:var(--dsw-alias-state-error-primary)}
             :is(.sr-settings,.sr-panel) .sr-warning{color:var(--dsw-alias-state-warn-primary)}
           `);
+        }
+        function ModelFilter({ id, value, onChange, disabled }) {
+          const [attempt, setAttempt] = React.useState(0);
+          const [directory, setDirectory] = React.useState({ groups: [], failures: [], status: 'loading' });
+          React.useEffect(() => {
+            let active = true;
+            const load = async () => {
+              try {
+                const response = await ctx.remote.session.modelCatalog();
+                if (!response?.ok) throw new Error(response?.error?.message ?? t('loadModelsError'));
+                const { groups, failures = [] } = response.value;
+                if (active) setDirectory({ groups, failures, status: 'ready' });
+              } catch (failure) {
+                if (active) setDirectory({ groups: [], failures: [], status: 'error', error: String(failure?.message ?? failure) });
+              }
+            };
+            void load();
+            return () => { active = false; };
+          }, [attempt]);
+
+          const groups = directory.groups.map(group => ({ ...group, models: group.models.map(model => ({
+            ...model, key: group.id + '/' + model.id,
+          })) }));
+          const models = groups.flatMap(group => group.models);
+          const selected = new Set(modelTokens(value));
+          const unrestricted = selected.size === 0;
+          const isChecked = model => unrestricted || selected.has(model.key) || selected.has(model.id);
+          const checkedCount = models.filter(isChecked).length;
+          const supported = new Set(models.flatMap(model => [model.key, model.id]));
+          const unavailable = [...selected].filter(key => !supported.has(key));
+          const update = (model, checked) => {
+            const next = new Set(unrestricted ? models.map(item => item.key) : selected);
+            if (checked) next.add(model.key);
+            else {
+              next.delete(model.key);
+              // Legacy entries may select the same model ID across several providers.
+              if (next.delete(model.id)) {
+                for (const item of models) if (item.id === model.id && item.key !== model.key) next.add(item.key);
+              }
+            }
+            if (!next.size) return;
+            const allSelected = !directory.failures.length && next.size === models.length && models.every(item => next.has(item.key));
+            onChange(allSelected ? '' : [...next].join('\n'));
+          };
+          const retry = () => {
+            setDirectory({ groups: [], failures: [], status: 'loading' });
+            setAttempt(previous => previous + 1);
+          };
+          const retryButton = () => h('button', { type: 'button', onClick: retry, disabled }, t('retryModels'));
+          return h('div', { className: 'sr-model' },
+            h('span', { id: id + '-models-label' }, t('modelFilter')),
+            h('p', { id: id + '-models-hint', className: 'sr-muted' }, t('modelFilterHint')),
+            directory.status === 'loading' && h('p', { className: 'sr-muted', role: 'status' }, t('loadingModels')),
+            directory.status === 'error' && h('div', { className: 'sr-model-feedback' },
+              h('p', { className: 'sr-error', role: 'alert' }, t('loadModelsError'), ': ', directory.error), retryButton()),
+            directory.status === 'ready' && directory.failures.length > 0 && h('div', { className: 'sr-model-feedback' },
+              h('p', { className: 'sr-warning', role: 'status' }, t('partialModels'), ': ', directory.failures.map(item => item.name || item.id).join(', ')), retryButton()),
+            directory.status === 'ready' && unavailable.length > 0 && h('p', { className: 'sr-muted' }, t('unavailableModels'), ': ', unavailable.join(', ')),
+            directory.status === 'ready' && !models.length && h('p', { className: 'sr-muted' }, t('noModels')),
+            h('div', { className: 'sr-model-feedback' },
+              h('button', { type: 'button', disabled: disabled || unrestricted, onClick: () => onChange('') }, t('selectAllModels'))),
+            directory.status === 'ready' && models.length > 0 && h('div', { className: 'sr-model-list', role: 'group', 'aria-labelledby': id + '-models-label', 'aria-describedby': id + '-models-hint' },
+              groups.map(group => h('fieldset', { key: group.id },
+                h('legend', null, group.name || group.id),
+                group.models.map(model => {
+                  const checked = isChecked(model);
+                  return h('label', { className: 'sr-model-option', key: model.key },
+                    h('input', { type: 'checkbox', value: model.key, checked, disabled: disabled || (checked && checkedCount === 1 && !unavailable.length), onChange: event => update(model, event.target.checked) }),
+                    h('span', null, model.name || model.id));
+                })))));
         }
         function SettingsForm({ id, draft, setDraft, busy, save, dirty, children }) {
           const checkbox = key => h('label', { className: 'sr-option', key },
@@ -100,11 +180,7 @@ window.__ModuleLoader__.load({
               h('input', { id: id + '-threshold', type: 'number', min: 2, max: 10000, step: 1, required: true, value: draft.threshold, disabled: busy, onChange: event => setDraft({ ...draft, threshold: event.target.value }) })),
             h('p', { className: 'sr-muted' }, t('hint')),
             Number(draft.threshold) > 90 && h('p', { className: 'sr-warning' }, t('warning')),
-            h('div', { className: 'sr-model' },
-              h('label', { htmlFor: id + '-models' }, t('modelFilter')),
-              h('textarea', { id: id + '-models', rows: 3, value: draft.modelFilter, disabled: busy, spellCheck: false, autoCapitalize: 'none',
-                'aria-describedby': id + '-models-hint', onChange: event => setDraft({ ...draft, modelFilter: event.target.value }) }),
-              h('p', { id: id + '-models-hint', className: 'sr-muted' }, t('modelFilterHint'))),
+            h(ModelFilter, { id, value: draft.modelFilter, disabled: busy, onChange: modelFilter => setDraft({ ...draft, modelFilter }) }),
             checkbox('autoContinue'), checkbox('autoSwitch'),
             h('p', { className: 'sr-muted' }, t('scope')),
             h('div', { className: 'sr-actions' }, h('button', { type: 'submit', disabled: busy || !dirty }, t(busy ? 'saving' : 'save')), children));
