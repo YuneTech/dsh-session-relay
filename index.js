@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { RelayUpdates, UPDATE_INTERVAL, checkGitHubUpdate } from './updates.js';
 import z from '@deepseek-ai/schemastery';
 import { z as schema } from 'zod';
 import { freezeMessage } from '@deepseek-ai/dsh-llm';
@@ -13,6 +15,7 @@ export const Config = z.object({
   modelFilter: z.string().default('').volatile(),
   autoContinue: z.boolean().default(true).volatile(),
   autoSwitch: z.boolean().default(true).volatile(),
+  autoUpdate: z.boolean().default(false).volatile(),
 });
 
 /** This batch was already claimed by pre-step; receipts must not suppress restoration. */
@@ -89,6 +92,80 @@ export async function apply(ctx, config) {
   ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/session-relay/settings', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: settingsFetch,
   }));
+  const manifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
+  let installing = false;
+  let activeRelayActions = 0;
+  async function relayAction(operation) {
+    if (installing) throw new Error('A plugin update is in progress. Try again after it completes.');
+    activeRelayActions++;
+    try { return await operation(); } finally { activeRelayActions--; }
+  }
+  const updates = new RelayUpdates({
+    currentVersion: manifest.version,
+    autoUpdate: () => config.autoUpdate?.get() ?? false,
+    supported: () => typeof ctx.get('pluginManager')?.updateBundle === 'function',
+    check: () => checkGitHubUpdate(manifest.version, { signal: lifetime.signal }),
+    install: async candidate => {
+      if (activeRelayActions || relay.tasks.size || [...handoffs.entries()].some(([, row]) => ['compressing', 'prepared', 'transferring'].includes(row.phase))) {
+        throw new Error('A relay is in progress. Try updating after it completes.');
+      }
+      installing = true;
+      try {
+        const manager = ctx.get('pluginManager');
+        const bundle = (await manager.listBundles()).find(item => item.name === manifest.name);
+        let result;
+        if (bundle?.update === 'git') {
+          const update = await manager.updateBundle(manifest.name, candidate.version, { spec: candidate.specifier });
+          if (update.step !== 'install') throw new Error(update.result?.error?.diagnostic ?? 'DSH refused the plugin update');
+          result = update.result;
+        } else if (bundle?.source === 'github:YuneTech/dsh-session-relay' && !ctx.get('hmr')) {
+          // Older installations saved an unpinned Git source. Without HMR the
+          // manager can replace it transactionally and pin the candidate for future updates.
+          result = await manager.installBundle(candidate.specifier, { expected: { name: manifest.name, version: candidate.version }, enabled: bundle.enabled });
+        } else {
+          throw new Error('This installation cannot update automatically. Reinstall the pinned GitHub version through DSH plugin management first.');
+        }
+        if (!['applied', 'restart-required'].includes(result?.application)) {
+          throw new Error(result?.error?.diagnostic ?? result?.packageResult?.output ?? 'DSH could not apply the plugin update');
+        }
+        return { restartRequired: result.application === 'restart-required' };
+      } finally { installing = false; }
+    },
+  });
+  const updatesFetch = async request => {
+    const respond = (value, status = 200) => new Response(JSON.stringify(value), {
+      status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'private, no-store' },
+    });
+    if (request.method === 'GET') return respond({ ok: true, value: updates.snapshot() });
+    try {
+      if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) {
+        return respond({ ok: false, error: 'Content-Type must be application/json' }, 415);
+      }
+      const text = await request.text();
+      if (new TextEncoder().encode(text).byteLength > 1024) return respond({ ok: false, error: 'Update request is too large' }, 413);
+      const body = JSON.parse(text);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Invalid update request');
+      if (body.action === 'check' || body.action === 'update') {
+        if (Object.keys(body).length !== 1) throw new Error('Unexpected update fields');
+        return respond({ ok: true, value: await updates.run(body.action === 'update') });
+      }
+      if (body.action !== 'autoUpdate' || typeof body.enabled !== 'boolean' || Object.keys(body).length !== 2) throw new Error('Invalid update action');
+      await ctx.configEditor.edit(ctx.fiber.entry, value => ({ ...value, autoUpdate: body.enabled }));
+      if (body.enabled) void updates.tick();
+      return respond({ ok: true, value: updates.snapshot() });
+    } catch (error) {
+      return respond({ ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  };
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/session-relay/updates', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: updatesFetch,
+  }));
+  ctx.effect(() => {
+    const timer = setInterval(() => { void updates.tick(); }, UPDATE_INTERVAL);
+    timer.unref?.();
+    void updates.tick();
+    return () => clearInterval(timer);
+  });
   const message = (id, content) => freezeMessage({ id, role: 'user', source: { kind: 'user' }, content });
   async function observation(agent, operation, signal) {
     const observed = await ctx.sessionQuery.observeSession(agent.id, { signal, projectionMode: 'none' });
@@ -196,8 +273,8 @@ export async function apply(ctx, config) {
     switch (request.action ?? 'status') {
       case 'status': return status(agent);
       case 'configure': await configure(request.settings ?? {}); return status(agent);
-      case 'retry': await relay.retry(agent); return status(agent);
-      case 'release': return { ...await relay.release(agent), ...status(agent) };
+      case 'retry': await relayAction(() => relay.retry(agent)); return status(agent);
+      case 'release': return { ...await relayAction(() => relay.release(agent)), ...status(agent) };
       default: throw new Error('Unknown action. Use status, configure, retry, or release.');
     }
   }
@@ -229,8 +306,9 @@ export async function apply(ctx, config) {
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next();
     if (decision.kind !== 'enter') return decision;
+    if (installing && !handoffs.get(payload.agent.id)) return decision;
     try {
-      if (await relay.boundary(payload.agent, decision.messages, true, payload.signal, payload.modelSelection)) return { kind: 'reject' };
+      if (await relayAction(() => relay.boundary(payload.agent, decision.messages, true, payload.signal, payload.modelSelection))) return { kind: 'reject' };
     } catch (error) {
       // The loop claims payload.messages before this listener and does not undo
       // that claim on rejection or failure. Restore only the original input,
@@ -247,6 +325,6 @@ export async function apply(ctx, config) {
     return decision;
   });
   ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
-    await relay.boundary(agent, [], false, signal);
+    if (!installing) await relayAction(() => relay.boundary(agent, [], false, signal));
   });
 }

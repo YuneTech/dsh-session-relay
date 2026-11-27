@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
 
-function client(fetch, modelCatalog = async () => ({ ok: true, value: { groups } })) {
+function client(fetch, modelCatalog = async () => ({ ok: true, value: { groups } }), { panel = false, execute, refresh = async () => {}, openSession = () => {}, updatesFetch = async () => Response.json({ ok: true, value: updateInitial }) } = {}) {
   let plugin;
   let cursor;
   let state = [];
@@ -40,13 +40,15 @@ function client(fetch, modelCatalog = async () => ({ ok: true, value: { groups }
     createElement: (type, props, ...children) => ({ type, props: { ...props, children: children.flat() } }),
   };
   runInNewContext(source, {
-    URL, AbortController, document: { baseURI: 'https://example.test/dsh/' }, fetch,
+    URL, AbortController, setTimeout, clearTimeout, setInterval, clearInterval, document: { baseURI: 'https://example.test/dsh/' }, fetch: (path, options) => path.endsWith('/updates') ? updatesFetch(path, options) : fetch(path, options),
     window: { __ModuleLoader__: { load: ({ factory }) => { plugin = factory(() => react); } } },
   });
   plugin.apply({
     effect: callback => callback(),
     locale: { register() {}, bind: () => key => key, subscribe() {}, getSnapshot() {} },
-    remote: { session: { modelCatalog } },
+    remote: { session: { modelCatalog }, commands: { execute } },
+    sessions: { binding: () => undefined, refresh },
+    uiWorkspace: { openSession },
     slots: {
       inject: (_name, register) => register(),
       register: ({ name, label }, Component) => slots.set(name, { Component, label }),
@@ -63,7 +65,8 @@ function client(fetch, modelCatalog = async () => ({ ok: true, value: { groups }
   return {
     render() {
       cursor = 0;
-      const tree = expand(Component());
+      const Render = panel ? slots.get('conversation.composer.dock').Component : Component;
+      const tree = expand(Render({ sessionId: 'old-session' }));
       effects.splice(0).forEach(effect => effect());
       return tree;
     },
@@ -79,6 +82,7 @@ function first(node, type, predicate = () => true) {
   }
 }
 
+const updateInitial = { currentVersion: '1.0.2', latestVersion: null, autoUpdate: false, supported: true, status: 'idle', updateAvailable: false, restartRequired: false, checkedAt: null, error: '' };
 const initial = { enabled: false, threshold: 90, modelFilter: '', autoContinue: true, autoSwitch: true };
 const groups = [
   { id: 'provider', name: 'Provider', models: [{ id: 'model', name: 'Model' }, { id: 'other', name: 'Other' }] },
@@ -96,6 +100,108 @@ async function loadSettings(ui) {
   await setImmediate();
   return ui.render();
 }
+
+test('update settings show progress, prevent duplicate checks, and report restart requirements', async () => {
+  const requests = [];
+  let finishCheck;
+  const ui = client(async () => Response.json({ ok: true, value: initial }), undefined, {
+    updatesFetch: async (_path, options) => {
+      if (!options.body) return Response.json({ ok: true, value: updateInitial });
+      const body = JSON.parse(options.body); requests.push(body);
+      if (body.action === 'check') return new Promise(resolve => { finishCheck = () => resolve(Response.json({ ok: true, value: { ...updateInitial, status: 'available', latestVersion: '1.0.3', updateAvailable: true } })); });
+      return Response.json({ ok: true, value: { ...updateInitial, status: 'updated', latestVersion: '1.0.3', installedVersion: '1.0.3', restartRequired: true } });
+    },
+  });
+  const loaded = await loadSettings(ui);
+  action(loaded, 'checkUpdates').onClick();
+  action(loaded, 'checkUpdates').onClick();
+  const checking = ui.render();
+  assert.equal(action(checking, 'checkUpdates').disabled, true);
+  assert.equal(first(checking, 'p', props => props.role === 'status').props.children[0], 'updateChecking');
+  finishCheck(); await setImmediate();
+  await action(ui.render(), 'installUpdate').onClick();
+  const installed = ui.render();
+  assert.equal(first(installed, 'p', props => props.role === 'status').props.children[0], 'updateRestart');
+  assert.deepEqual(requests, [{ action: 'check' }, { action: 'update' }]);
+  ui.unmount();
+});
+
+test('self-update reconnects with the replacement instance without repeating installation', async () => {
+  const requests = [];
+  let replaced = false;
+  const ui = client(async () => Response.json({ ok: true, value: initial }), undefined, { updatesFetch: async (_path, options) => {
+    if (options.body) {
+      requests.push(JSON.parse(options.body)); replaced = true;
+      throw new Error('connection closed by HMR');
+    }
+    return Response.json({ ok: true, value: replaced ? { ...updateInitial, currentVersion: '1.0.3' } : { ...updateInitial, updateAvailable: true } });
+  } });
+  const loaded = await loadSettings(ui);
+  await action(loaded, 'installUpdate').onClick();
+  const installed = ui.render();
+  assert.equal(first(installed, 'p', props => props.role === 'alert'), undefined);
+  assert.ok(first(installed, 'p', props => props.children.includes('1.0.3')));
+  assert.deepEqual(requests, [{ action: 'update' }]);
+  ui.unmount();
+});
+
+test('automatic update preference saves independently and reports a failed save', async () => {
+  let fail = true;
+  const updates = [];
+  const ui = client(async () => Response.json({ ok: true, value: initial }), undefined, {
+    updatesFetch: async (_path, options) => {
+      if (!options.body) return Response.json({ ok: true, value: updateInitial });
+      updates.push(JSON.parse(options.body));
+      return fail ? Response.json({ ok: false, error: 'write failed' }, { status: 400 })
+        : Response.json({ ok: true, value: { ...updateInitial, autoUpdate: true } });
+    },
+  });
+  const toggle = tree => first(first(tree, 'label', props => props.children.includes('autoUpdate')), 'input').props;
+  const loaded = await loadSettings(ui);
+  await toggle(loaded).onChange({ target: { checked: true } });
+  const failed = ui.render();
+  assert.equal(toggle(failed).checked, false);
+  assert.match(first(failed, 'p', props => props.role === 'alert').props.children.join(''), /write failed/);
+  fail = false;
+  await toggle(failed).onChange({ target: { checked: true } });
+  assert.equal(toggle(ui.render()).checked, true);
+  assert.deepEqual(updates, [{ action: 'autoUpdate', enabled: true }, { action: 'autoUpdate', enabled: true }]);
+  ui.unmount();
+});
+
+test('conversation dock displays status and recovery without a settings entry or form', async () => {
+  const commands = [];
+  const opened = [];
+  let handoff;
+  const ui = client(() => { throw new Error('settings must not be requested from the dock'); }, undefined, {
+    panel: true, openSession: id => opened.push(id),
+    execute: async (_id, line) => {
+      commands.push(line);
+      return { ok: true, value: { result: { kind: 'success', text: JSON.stringify({ ...initial, replies: 42, handoff }) } } };
+    },
+  });
+  ui.render();
+  await setImmediate();
+  const loaded = ui.render();
+  assert.equal(first(loaded, 'form'), undefined);
+  assert.equal(first(loaded, 'input'), undefined);
+  assert.equal(first(loaded, 'button'), undefined);
+  assert.equal(first(loaded, 'span', props => props.className === 'sr-status').props.children[0], '42 / 90 replies');
+  ui.unmount();
+
+  handoff = { phase: 'error', error: 'network failed', recoverable: true, targetCreated: true, targetId: 'new-session' };
+  ui.render();
+  await setImmediate();
+  const failed = ui.render();
+  assert.equal(first(failed, 'form'), undefined);
+  assert.equal(first(failed, 'button', props => props['aria-expanded'] !== undefined), undefined);
+  action(failed, 'retry').onClick();
+  await setImmediate();
+  assert.equal(commands.at(-1), '/relay {"action":"retry"}');
+  await action(ui.render(), 'open').onClick();
+  assert.deepEqual(opened, ['new-session']);
+  ui.unmount();
+});
 
 test('settings save and reload catalog selections without a session, then restore all models', async () => {
   let value = initial;

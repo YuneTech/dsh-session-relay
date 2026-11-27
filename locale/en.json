@@ -7,5 +7,6 @@
   "threshold": "Model reply threshold",
   "modelFilter": "Models that trigger relay",
   "autoContinue": "Resume unfinished tasks",
-  "autoSwitch": "Open the new session automatically"
+  "autoSwitch": "Open the new session automatically",
+  "autoUpdate": "Update plugin automatically"
 }

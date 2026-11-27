@@ -34,7 +34,7 @@ async function harness(initialRows = new Map(), options = {}) {
   const maintenance = [];
   const effects = { creates: 0, flushes: 0, queries: 0, compactions: 0 };
   const settingValues = { enabled: true, threshold: 90, modelFilter: '', autoContinue: true, autoSwitch: true, ...options.config };
-  const config = Object.fromEntries(Object.keys(settingValues).map(key => [key, { get: () => settingValues[key] }]));
+  const config = { ...Object.fromEntries(Object.keys(settingValues).map(key => [key, { get: () => settingValues[key] }])), autoUpdate: { get: () => settingValues.autoUpdate ?? false } };
   const routes = new Map();
   const configEdits = [];
   let command;
@@ -135,7 +135,7 @@ async function harness(initialRows = new Map(), options = {}) {
     tools: { register() {} },
     on: (name, callback) => listeners.set(name, callback),
     effect: setup => { setup(); },
-    get: key => key === 'compaction' ? options.globalCompaction : undefined,
+    get: key => key === 'pluginManager' ? options.pluginManager : key === 'hmr' ? options.hmr : key === 'compaction' ? options.globalCompaction : undefined,
   };
   await plugin.apply(ctx, config);
   return {
@@ -147,10 +147,102 @@ async function harness(initialRows = new Map(), options = {}) {
         method, ...(body === undefined ? {} : { headers: { 'content-type': contentType }, body: JSON.stringify(body) }),
       }));
     },
+    updatesRequest: (body) => {
+      const route = routes.get('/api/session-relay/updates:GET,POST');
+      assert.ok(route, 'updates route is registered');
+      return route.fetch(new Request('http://localhost/api/session-relay/updates', {
+        method: body === undefined ? 'GET' : 'POST',
+        ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+      }));
+    },
     command: rawInput => command({ agent: old, rawInput, signal: new AbortController().signal }),
     settle: async () => { await new Promise(setImmediate); await Promise.all(maintenance); },
   };
 }
+
+test('updates route persists preferences, validates requests, and handles a missing manager', { skip: !hasRuntime }, async () => {
+  const h = await harness();
+  const value = (await (await h.updatesRequest()).json()).value;
+  assert.equal(value.currentVersion, '1.0.2');
+  assert.equal(value.autoUpdate, false);
+  assert.equal(value.supported, false);
+  assert.equal((await h.updatesRequest({ action: 'autoUpdate', enabled: 'true' })).status, 400);
+  assert.equal((await h.updatesRequest({ action: 'update', specifier: 'untrusted' })).status, 400);
+  assert.equal((await h.updatesRequest({ action: 'autoUpdate', enabled: true })).status, 200);
+  assert.equal(h.settingValues.autoUpdate, true);
+  assert.equal(h.settingValues.threshold, 90);
+  const checked = (await (await h.updatesRequest({ action: 'check' })).json()).value;
+  assert.equal(checked.status, 'error');
+  assert.match(checked.error, /plugin manager is unavailable/);
+  await h.updatesRequest({ action: 'autoUpdate', enabled: false });
+});
+
+test('updates use the host pinned Git source and report installation failures accurately', { skip: !hasRuntime }, async t => {
+  const sha = 'b'.repeat(40);
+  t.mock.method(globalThis, 'fetch', async url => Response.json(String(url).includes('/commits/') ? { sha } : { name: 'dsh-session-relay', version: '1.0.3' }));
+  let fail = true;
+  const calls = [];
+  const h = await harness(new Map(), { pluginManager: { listBundles: async () => [{ name: 'dsh-session-relay', update: 'git' }], updateBundle: async (...args) => {
+    calls.push(args);
+    return { step: 'install', result: fail ? { application: 'failed', error: { diagnostic: 'download failed' } } : { application: 'applied' } };
+  } } });
+  const checked = (await (await h.updatesRequest({ action: 'check' })).json()).value;
+  assert.equal(checked.updateAvailable, true);
+  assert.equal(calls.length, 0);
+  const failed = (await (await h.updatesRequest({ action: 'update' })).json()).value;
+  assert.equal(failed.status, 'error');
+  assert.equal(failed.error, 'download failed');
+  assert.equal(failed.restartRequired, false);
+  assert.equal(failed.installedVersion, null);
+  fail = false;
+  const installed = (await (await h.updatesRequest({ action: 'update' })).json()).value;
+  assert.equal(installed.status, 'updated');
+  assert.equal(installed.restartRequired, false);
+  assert.deepEqual(calls.at(-1), ['dsh-session-relay', '1.0.3', { spec: 'github:YuneTech/dsh-session-relay#' + sha }]);
+});
+
+test('legacy GitHub sources migrate through the host without HMR and block new relays until installation finishes', { skip: !hasRuntime }, async t => {
+  const sha = 'c'.repeat(40);
+  t.mock.method(globalThis, 'fetch', async url => Response.json(String(url).includes('/commits/') ? { sha } : { name: 'dsh-session-relay', version: '1.0.3' }));
+  let finish;
+  let started;
+  const began = new Promise(resolve => { started = resolve; });
+  const calls = [];
+  const h = await harness(new Map(), { pluginManager: {
+    listBundles: async () => [{ name: 'dsh-session-relay', source: 'github:YuneTech/dsh-session-relay', enabled: true }],
+    updateBundle: async () => { throw new Error('legacy source must not use updateBundle'); },
+    installBundle: async (...args) => { calls.push(args); started(); return new Promise(resolve => { finish = resolve; }); },
+  } });
+  const pending = h.updatesRequest({ action: 'update' });
+  await began;
+  const decision = { kind: 'enter', messages: [] };
+  assert.equal(await h.listeners.get('agent/pre-step')({ agent: h.old, messages: [] }, async () => decision), decision);
+  await h.listeners.get('agent/turn-stopping')({ agent: h.old });
+  assert.equal(h.rows.size, 0);
+  const retry = await h.command('retry');
+  assert.equal(retry.kind, 'error');
+  assert.match(retry.text, /plugin update is in progress/);
+  finish({ application: 'restart-required' });
+  const installed = (await (await pending).json()).value;
+  assert.equal(installed.restartRequired, true);
+  assert.deepEqual(calls, [['github:YuneTech/dsh-session-relay#' + sha, { expected: { name: 'dsh-session-relay', version: '1.0.3' }, enabled: true }]]);
+});
+
+test('an active relay prevents updates and legacy HMR installs require a pinned source', { skip: !hasRuntime }, async t => {
+  const sha = 'd'.repeat(40);
+  t.mock.method(globalThis, 'fetch', async url => Response.json(String(url).includes('/commits/') ? { sha } : { name: 'dsh-session-relay', version: '1.0.3' }));
+  let installs = 0;
+  const h = await harness(new Map(), { hmr: {}, pluginManager: {
+    updateBundle: async () => { installs++; },
+    listBundles: async () => [{ name: 'dsh-session-relay', source: 'github:YuneTech/dsh-session-relay' }],
+    installBundle: async () => { installs++; },
+  } });
+  h.rows.set(h.old.id, savedRow({ phase: 'compressing' }));
+  assert.match((await (await h.updatesRequest({ action: 'update' })).json()).value.error, /relay is in progress/);
+  h.rows.clear();
+  assert.match((await (await h.updatesRequest({ action: 'update' })).json()).value.error, /Reinstall the pinned GitHub version/);
+  assert.equal(installs, 0);
+});
 
 test('global settings route reads and persists partial updates without a session', { skip: !hasRuntime }, async () => {
   const h = await harness();

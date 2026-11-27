@@ -7,3 +7,4 @@
         modelFilter: ''
         autoContinue: true
         autoSwitch: true
+        autoUpdate: false

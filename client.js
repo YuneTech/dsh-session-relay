@@ -20,7 +20,12 @@ window.__ModuleLoader__.load({
     };
     const words = {
       zh: {
-        title: '会话接力', on: '已开启', off: '未开启', replies: '次模型回复', settings: '设置',
+        title: '会话接力', on: '已开启', off: '未开启', replies: '次模型回复',
+        updates: '插件更新', currentVersion: '当前版本', latestVersion: '最新版本', checkUpdates: '检测更新', installUpdate: '立即更新',
+        autoUpdate: '自动更新插件', autoUpdateHint: '每 6 小时检测并安装新版本；需要重启时会提示。',
+        updateLoading: '正在读取更新状态…', updateChecking: '正在检测更新…', updateInstalling: '正在安装更新…',
+        updateAvailable: '有新版本可用', updateCurrent: '已是最新版本', updateInstalled: '更新已安装', updateRestart: '更新已安装，重启 DSH 后生效。',
+        updateResultUnknown: '更新连接已断开，请重新读取状态核对当前版本。', updateError: '更新状态异常', updateUnavailable: '当前 DSH 未提供插件更新服务', updateCheckedAt: '上次检测', retryUpdates: '重新读取更新状态',
         enabled: '启用自动接力', threshold: '模型回复次数阈值',
         modelFilter: '触发接力的模型', modelFilterHint: '不限模型，或至少勾选一个。', selectAllModels: '不限模型', loadingModels: '正在加载模型目录…',
         loadModelsError: '无法读取模型目录', retryModels: '重新加载模型', partialModels: '未能加载部分供应商',
@@ -35,7 +40,12 @@ window.__ModuleLoader__.load({
         compressing: '正在压缩', prepared: '等待安全切换', transferring: '正在转移上下文', done: '已接力到新会话', failed: '需要处理',
       },
       en: {
-        title: 'Session Relay', on: 'On', off: 'Off', replies: 'model replies', settings: 'Settings',
+        title: 'Session Relay', on: 'On', off: 'Off', replies: 'model replies',
+        updates: 'Plugin updates', currentVersion: 'Current version', latestVersion: 'Latest version', checkUpdates: 'Check for updates', installUpdate: 'Update now',
+        autoUpdate: 'Update plugin automatically', autoUpdateHint: 'Check and install new versions every 6 hours. A restart prompt appears when needed.',
+        updateLoading: 'Loading update status…', updateChecking: 'Checking for updates…', updateInstalling: 'Installing update…',
+        updateAvailable: 'An update is available', updateCurrent: 'You have the latest version', updateInstalled: 'Update installed', updateRestart: 'Update installed. Restart DSH to apply it.',
+        updateResultUnknown: 'The update connection closed. Reload the status to verify the installed version.', updateError: 'Update status error', updateUnavailable: 'The DSH plugin update service is unavailable', updateCheckedAt: 'Last checked', retryUpdates: 'Reload update status',
         enabled: 'Enable automatic relay', threshold: 'Model reply threshold',
         modelFilter: 'Models that trigger relay', modelFilterHint: 'Allow all models, or check at least one.', selectAllModels: 'Allow all models', loadingModels: 'Loading model catalog…',
         loadModelsError: 'Could not load model catalog', retryModels: 'Reload models', partialModels: 'Some providers could not be loaded',
@@ -56,9 +66,9 @@ window.__ModuleLoader__.load({
         ctx.effect(() => ctx.locale.register('session-relay', words));
         const t = ctx.locale.bind('session-relay');
         const settingsListeners = new Set();
-        const requestSettings = async (signal, patch) => {
+        const requestValue = async (path, signal, patch) => {
           const mount = new URL('.', document.baseURI).pathname.slice(0, -1);
-          const response = await fetch(mount + '/api/session-relay/settings', {
+          const response = await fetch(mount + '/api/session-relay/' + path, {
             signal, cache: 'no-store',
             ...(patch === undefined ? {} : {
               method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
@@ -70,12 +80,14 @@ window.__ModuleLoader__.load({
           }
           return result.value;
         };
+        const requestSettings = (signal, patch) => requestValue('settings', signal, patch);
         function SettingsStyles() {
           return h('style', null, `
             .sr-panel{color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;border-top:1px solid var(--dsw-alias-border-l1);padding:4px 8px;margin-top:4px}
             .sr-panel .sr-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:36px}.sr-panel .sr-title{font-weight:600}.sr-panel .sr-status{font-variant-numeric:tabular-nums;margin-inline-start:auto}
             .sr-settings{max-width:100%;color:var(--dsw-alias-label-primary);font:inherit;font-size:14px}
             .sr-settings h2{font-size:18px;line-height:1.35;margin:0 0 12px;font-weight:600}
+            .sr-updates{padding-bottom:16px;margin-bottom:16px;border-bottom:1px solid var(--dsw-alias-border-l1)}.sr-updates h3{font-size:15px;line-height:1.5;margin:0 0 8px;font-weight:600}
             :is(.sr-settings,.sr-panel) p{margin:8px 0;line-height:1.6;overflow-wrap:anywhere}
             :is(.sr-settings,.sr-panel) .sr-muted{color:var(--dsw-alias-label-secondary)}
             :is(.sr-settings,.sr-panel) .sr-form{padding:8px 0}
@@ -185,6 +197,66 @@ window.__ModuleLoader__.load({
             h('p', { className: 'sr-muted' }, t('scope')),
             h('div', { className: 'sr-actions' }, h('button', { type: 'submit', disabled: busy || !dirty }, t(busy ? 'saving' : 'save')), children));
         }
+        function UpdateSettings() {
+          const id = React.useId();
+          const [data, setData] = React.useState(null);
+          const [busy, setBusy] = React.useState(false);
+          const [error, setError] = React.useState('');
+          const controllerRef = React.useRef(null);
+          const pending = React.useRef(false);
+          const run = async (action, enabled) => {
+            const controller = controllerRef.current;
+            if (!controller || controller.signal.aborted || pending.current) return;
+            pending.current = true; setBusy(true); setError('');
+            if (action === 'check' || action === 'update') setData(value => ({ ...value, status: action === 'update' ? 'updating' : 'checking', error: '' }));
+            try {
+              const value = await requestValue('updates', controller.signal, action ? { action, ...(action === 'autoUpdate' ? { enabled } : {}) } : undefined);
+              if (!controller.signal.aborted) setData(value);
+            } catch (failure) {
+              if (!controller.signal.aborted) {
+                // HMR can unload the calling plugin before its response arrives.
+                // Read the replacement instance rather than retrying installation.
+                if (action === 'update') {
+                  try {
+                    const latest = await requestValue('updates', controller.signal);
+                    if (controller.signal.aborted) return;
+                    if (latest.currentVersion !== data?.currentVersion || ['updated', 'updating'].includes(latest.status)) { setData(latest); return; }
+                  } catch {}
+                }
+                setError(action === 'update' ? t('updateResultUnknown') : String(failure.message ?? failure));
+                setData(value => value ? { ...value, status: 'error' } : value);
+              }
+            } finally {
+              if (!controller.signal.aborted) { pending.current = false; setBusy(false); }
+            }
+          };
+          React.useEffect(() => {
+            const controller = new AbortController();
+            controllerRef.current = controller; pending.current = false;
+            void run();
+            return () => controller.abort();
+          }, []);
+          const working = busy || ['checking', 'updating'].includes(data?.status);
+          React.useEffect(() => {
+            const timer = setInterval(() => { if (!document.hidden) void run(); }, ['checking', 'updating'].includes(data?.status) ? 1500 : 15000);
+            return () => clearInterval(timer);
+          }, [data?.status]);
+          const statusKey = { checking: 'updateChecking', updating: 'updateInstalling', available: 'updateAvailable', current: 'updateCurrent', updated: 'updateInstalled' }[data?.status];
+          return h('section', { className: 'sr-updates', 'aria-labelledby': id + '-updates', 'aria-busy': working },
+            h('h3', { id: id + '-updates' }, t('updates')),
+            !data && !error && h('p', { className: 'sr-muted', role: 'status' }, t('updateLoading')),
+            data?.currentVersion && h('p', null, t('currentVersion'), ': ', data.currentVersion, data.latestVersion && ` · ${t('latestVersion')}: ${data.latestVersion}`),
+            data && !data.supported && h('p', { className: 'sr-warning' }, t('updateUnavailable')),
+            data && h('label', { className: 'sr-option' }, h('input', { type: 'checkbox', checked: !!data.autoUpdate, disabled: working || (!data.supported && !data.autoUpdate), onChange: event => run('autoUpdate', event.target.checked) }), t('autoUpdate')),
+            h('p', { className: 'sr-muted' }, t('autoUpdateHint')),
+            data && h('div', { className: 'sr-actions' },
+              h('button', { type: 'button', disabled: working || !data.supported, onClick: () => run('check') }, t('checkUpdates')),
+              data.updateAvailable && h('button', { type: 'button', disabled: working || !data.supported, onClick: () => run('update') }, t('installUpdate'))),
+            statusKey && h('p', { role: 'status' }, t(data?.restartRequired ? 'updateRestart' : statusKey)),
+            data?.checkedAt && h('p', { className: 'sr-muted' }, t('updateCheckedAt'), ': ', new Date(data.checkedAt).toLocaleString()),
+            (error || data?.error) && h('p', { className: 'sr-error', role: 'alert' }, t('updateError'), ': ', error || data.error),
+            error && h('button', { type: 'button', disabled: working, onClick: () => run() }, t('retryUpdates')));
+        }
         function RelaySettings() {
           React.useSyncExternalStore(ctx.locale.subscribe.bind(ctx.locale), ctx.locale.getSnapshot.bind(ctx.locale));
           const id = React.useId();
@@ -231,6 +303,7 @@ window.__ModuleLoader__.load({
           const dirty = draft && settingKeys.some(key => draft[key] !== baseline[key]);
           return h('section', { className: 'sr-settings', 'aria-labelledby': id + '-title' },
             h(SettingsStyles), h('h2', { id: id + '-title' }, t('title')),
+            h(UpdateSettings),
             status === 'loading' && h('p', { className: 'sr-muted', role: 'status' }, t('loadingSettings')),
             status === 'loadError' && h('button', { type: 'button', onClick: () => run() }, t('retryLoad')),
             draft && h(SettingsForm, { id: id + '-form', draft, setDraft: change, busy: status === 'saving', save, dirty }),
@@ -243,19 +316,15 @@ window.__ModuleLoader__.load({
           const [data, setData] = React.useState(null);
           const [error, setError] = React.useState('');
           const [busy, setBusy] = React.useState(false);
-          const [draft, setDraft] = React.useState(null);
-          const baseline = React.useRef(null);
-          const [expanded, setExpanded] = React.useState(false);
           const fetchRef = React.useRef(null);
           const abortRef = React.useRef(null);
           const loaded = React.useRef(false);
           const opened = React.useRef(null);
-          const id = React.useId();
           React.useEffect(() => {
             const controller = new AbortController();
             abortRef.current = controller;
-            loaded.current = false; opened.current = null; baseline.current = null;
-            setData(null); setDraft(null); setError(''); setBusy(false);
+            loaded.current = false; opened.current = null;
+            setData(null); setError(''); setBusy(false);
             let scheduled;
             let lastSeq = -1;
             let request = Promise.resolve();
@@ -276,13 +345,6 @@ window.__ModuleLoader__.load({
                   if (result?.kind !== 'success') throw new Error(result?.text ?? 'Session Relay command is unavailable');
                   const value = JSON.parse(result.text);
                   setData(value); setError('');
-                  const next = settingsDraft(value);
-                  const previous = baseline.current;
-                  baseline.current = next;
-                  setDraft(draft => {
-                    if (!draft || !previous || mutate) return next;
-                    return Object.fromEntries(settingKeys.map(key => [key, draft[key] === previous[key] ? next[key] : draft[key]]));
-                  });
                   if (!loaded.current && value.handoff?.phase === 'done') opened.current = value.handoff.targetId;
                   if (loaded.current && value.handoff?.phase === 'done' && value.autoSwitch && opened.current !== value.handoff.targetId) {
                     opened.current = value.handoff.targetId;
@@ -335,12 +397,6 @@ window.__ModuleLoader__.load({
             return () => clearInterval(timer);
           }, [phase]);
           const call = request => fetchRef.current?.(`/relay ${JSON.stringify(request)}`, true);
-          const save = event => {
-            event.preventDefault();
-            const patch = settingsPatch(draft, baseline.current);
-            if (patch === null) { setError(t('countError')); return; }
-            if (Object.keys(patch).length) void call({ action: 'configure', settings: patch });
-          };
           const openTarget = async () => {
             const controller = abortRef.current;
             const targetId = data.handoff.targetId;
@@ -352,26 +408,22 @@ window.__ModuleLoader__.load({
               if (!controller.signal.aborted) setError(String(failure.message ?? failure));
             }
           };
-          const dirty = draft && baseline.current && settingKeys.some(key => draft[key] !== baseline.current[key]);
           return h('section', { className: 'sr-panel', 'aria-label': t('title') },
             h(SettingsStyles),
 
             h('div', { className: 'sr-top' },
               h('span', { className: 'sr-title' }, t('title')),
               h('span', { className: 'sr-muted' }, data ? t(data.enabled ? 'on' : 'off') : '…'),
-              data && h('span', { className: 'sr-status' }, `${data.replies} / ${data.threshold} ${t('replies')}`),
-              h('button', { type: 'button', 'aria-expanded': expanded, 'aria-controls': `${id}-form`, onClick: () => setExpanded(!expanded) }, t('settings'))),
+              data && h('span', { className: 'sr-status' }, `${data.replies} / ${data.threshold} ${t('replies')}`)),
             phase && h('p', { role: 'status' }, t(phase === 'error' ? 'failed' : phase)),
             error && h('p', { className: 'sr-error', role: 'alert' }, error),
-            error && !draft && h('button', { type: 'button', disabled: busy, onClick: () => fetchRef.current?.('/relay status', true) }, t(busy ? 'saving' : 'retryLoad')),
+            error && !data && h('button', { type: 'button', disabled: busy, onClick: () => fetchRef.current?.('/relay status', true) }, t(busy ? 'saving' : 'retryLoad')),
             data?.handoff?.error && h('p', { className: 'sr-error', role: 'alert' }, t('error'), data.handoff.error),
             data?.handoff && h('div', { className: 'sr-actions' },
               data.handoff.targetCreated && h('button', { type: 'button', onClick: openTarget }, t('open')),
               phase === 'error' && data.handoff.recoverable && h('button', { type: 'button', disabled: busy, onClick: () => call({ action: 'retry' }) }, t('retry')),
               phase === 'error' && !data.handoff.targetCreated && h('button', { type: 'button', disabled: busy, onClick: () => call({ action: 'release' }) }, t('release'))),
-            expanded && draft && h(SettingsForm, { id: id + '-form', draft, setDraft, busy, save, dirty },
-              h('button', { type: 'button', disabled: busy, onClick: () => fetchRef.current?.() }, t('refresh'))),
-            expanded && data?.eligible === false && h('p', { className: 'sr-warning' }, t('subagent')));
+            data?.eligible === false && h('p', { className: 'sr-warning' }, t('subagent')));
         }
         ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'session-relay', order: 100, label: () => t('title') }, RelaySettings));
         ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({ name: 'conversation.composer.dock', id: 'session-relay', order: 20 }, RelayPanel));
