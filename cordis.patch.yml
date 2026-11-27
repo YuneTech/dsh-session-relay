@@ -4,5 +4,6 @@
       config:
         enabled: false
         threshold: 90
+        modelFilter: ''
         autoContinue: true
         autoSwitch: true

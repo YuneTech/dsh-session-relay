@@ -6,10 +6,11 @@ import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-a
 import { SessionRelay, DEFAULT_THRESHOLD, MIN_THRESHOLD, MAX_THRESHOLD, validateSettings, receivedMessageIds } from './relay.js';
 
 export const name = 'session-relay';
-export const inject = ['commands', 'tools', 'sessionProjections', 'sessionQuery', 'storageDomain', 'sessionController', 'sessionPersistence', 'workingDirectory', 'agentPresets', 'configEditor'];
+export const inject = ['commands', 'tools', 'sessionProjections', 'sessionQuery', 'storageDomain', 'sessionController', 'sessionPersistence', 'workingDirectory', 'agentPresets', 'configEditor', 'connection'];
 export const Config = z.object({
   enabled: z.boolean().default(false).volatile(),
   threshold: z.number().min(MIN_THRESHOLD).max(MAX_THRESHOLD).step(1).default(DEFAULT_THRESHOLD).volatile(),
+  modelFilter: z.string().default('').volatile(),
   autoContinue: z.boolean().default(true).volatile(),
   autoSwitch: z.boolean().default(true).volatile(),
 });
@@ -58,6 +59,7 @@ export async function apply(ctx, config) {
   ctx.effect(() => () => counter.dispose());
   const current = () => ({
     enabled: config.enabled.get(), threshold: config.threshold.get(),
+    modelFilter: config.modelFilter.get(),
     autoContinue: config.autoContinue.get(), autoSwitch: config.autoSwitch.get(),
   });
   const configure = async patch => {
@@ -65,6 +67,28 @@ export async function apply(ctx, config) {
     await ctx.configEditor.edit(ctx.fiber.entry, value => ({ ...value, ...patch }));
     return current();
   };
+  const settingsFetch = async request => {
+    const respond = (body, status = 200) => new Response(JSON.stringify(body), {
+      status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'private, no-store' },
+    });
+    if (request.method === 'GET') return respond({ ok: true, value: current() });
+    try {
+      if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) {
+        return respond({ ok: false, error: 'Content-Type must be application/json' }, 415);
+      }
+      const text = await request.text();
+      if (new TextEncoder().encode(text).byteLength > 16384) return respond({ ok: false, error: 'Settings request is too large' }, 413);
+      const patch = JSON.parse(text);
+      validateSettings(patch);
+      await configure(patch);
+      return respond({ ok: true, value: current() });
+    } catch (error) {
+      return respond({ ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  };
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/session-relay/settings', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: settingsFetch,
+  }));
   const message = (id, content) => freezeMessage({ id, role: 'user', source: { kind: 'user' }, content });
   async function observation(agent, operation, signal) {
     const observed = await ctx.sessionQuery.observeSession(agent.id, { signal, projectionMode: 'none' });
@@ -197,7 +221,7 @@ export async function apply(ctx, config) {
     description: 'Read/configure Session Relay automation. Only change settings at the user’s request. Does not consume a model reply for the operation itself. retry retries saved handoff; release disables automation and restores untransferred input.',
     parameters: { type: 'object', properties: {
       action: { type: 'string', enum: ['status', 'configure', 'retry', 'release'] },
-      settings: { type: 'object', properties: { enabled: { type: 'boolean' }, threshold: { type: 'integer', minimum: MIN_THRESHOLD, maximum: MAX_THRESHOLD }, autoContinue: { type: 'boolean' }, autoSwitch: { type: 'boolean' } }, additionalProperties: false },
+      settings: { type: 'object', properties: { enabled: { type: 'boolean' }, threshold: { type: 'integer', minimum: MIN_THRESHOLD, maximum: MAX_THRESHOLD }, modelFilter: { type: 'string', description: 'Exact model IDs or provider/model, separated by commas or newlines. Empty allows all models.' }, autoContinue: { type: 'boolean' }, autoSwitch: { type: 'boolean' } }, additionalProperties: false },
     }, additionalProperties: false },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     execute: async (args, exec) => { if (!exec.agent) throw new Error('Session required'); return action(exec.agent, args ?? {}, exec.signal); },
@@ -206,7 +230,7 @@ export async function apply(ctx, config) {
     const decision = await next();
     if (decision.kind !== 'enter') return decision;
     try {
-      if (await relay.boundary(payload.agent, decision.messages, true, payload.signal)) return { kind: 'reject' };
+      if (await relay.boundary(payload.agent, decision.messages, true, payload.signal, payload.modelSelection)) return { kind: 'reject' };
     } catch (error) {
       // The loop claims payload.messages before this listener and does not undo
       // that claim on rejection or failure. Restore only the original input,

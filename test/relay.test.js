@@ -36,6 +36,8 @@ function fixture(overrides = {}) {
 test('settings reject fractional, NaN, negative, invalid and unknown values', () => {
   for (const threshold of [0, 1, -1, 1.5, NaN, Infinity, 10001, '90']) assert.throws(() => validateSettings({ threshold }));
   for (const threshold of [2, 90, 100, 10000]) assert.equal(validateSettings({ threshold }).threshold, threshold);
+  for (const modelFilter of [null, [], true, 42]) assert.throws(() => validateSettings({ modelFilter }));
+  for (const modelFilter of ['', 'test/model, other\nthird']) assert.deepEqual(validateSettings({ modelFilter }), { modelFilter });
   assert.throws(() => validateSettings({ enabled: 1 }));
   assert.throws(() => validateSettings({ unknown: true }));
 });
@@ -51,8 +53,34 @@ test('no action below threshold, when disabled, or for a child agent', async () 
   assert.equal(f.effects.compactions, 0);
 });
 
-test('exact threshold summarizes once, transfers claimed+both pending queues once and wakes new work', async () => {
+test('model allowlist matches exact model or provider/model entries separated by commas or lines', async t => {
+  const cases = [
+    ['empty allows every model', '', { provider: 'other', model: 'unlisted' }, true],
+    ['model ID matches regardless of provider', 'other, model\r\nthird', { provider: 'another', model: 'model' }, true],
+    ['qualified entry trims surrounding whitespace', 'other,\n  relay/model  ', { provider: 'relay', model: 'model' }, true],
+    ['qualified entry matches only its provider', 'relay/model', { provider: 'other', model: 'model' }, false],
+    ['similar model IDs do not match', 'relay/model, model', { provider: 'relay', model: 'model-preview' }, false],
+    ['case is not folded', 'relay/Model', { provider: 'relay', model: 'model' }, false],
+    ['patterns are not interpreted', 'relay/*, model-*', { provider: 'relay', model: 'model-preview' }, false],
+    ['unknown model does not match a configured entry', 'relay/model', null, false],
+  ];
+  for (const [name, modelFilter, selection, allowed] of cases) await t.test(name, async () => {
+    const f = fixture({ selection: () => selection });
+    await f.a.configure({ modelFilter });
+    assert.equal(await f.relay.boundary(f.old, [], false), allowed);
+    await f.settle();
+    assert.equal(f.effects.compactions, Number(allowed));
+    assert.equal(f.effects.creates, Number(allowed));
+    assert.equal(f.rows.size, Number(allowed));
+  });
+});
+
+test('configured threshold summarizes once, transfers claimed+both pending queues once and wakes new work', async () => {
   const f = fixture();
+  await f.a.configure({ threshold: 91 });
+  assert.equal(await f.relay.boundary(f.old, [], true), false);
+  assert.equal(f.effects.compactions, 0);
+  f.old.count = 91;
   f.old.pending = [msg('pending'), msg('claimed')];
   assert.equal(await f.relay.boundary(f.old, [msg('claimed')], true, new AbortController().signal), true);
   await f.settle();
@@ -95,10 +123,12 @@ test('failed compression parks claimed input and never launches a target or fall
   assert.equal(f.rows.size, 0);
 });
 
-test('new input is forwarded through an old completed session without another compaction', async () => {
+test('new input is forwarded through an old completed session even after its model is filtered out', async () => {
   const f = fixture();
   await f.relay.boundary(f.old, [], false); await f.settle();
-  await f.relay.boundary(f.old, [msg('later')], true); await f.settle();
+  await f.a.configure({ modelFilter: 'other/model' });
+  assert.equal(await f.relay.boundary(f.old, [msg('later')], true), true);
+  await f.settle();
   assert.equal(f.effects.compactions, 1);
   assert.equal(f.effects.creates, 1);
   assert.deepEqual(f.target.messages.slice(1).map(item => item.id), ['later']);

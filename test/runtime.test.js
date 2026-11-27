@@ -33,10 +33,15 @@ async function harness(initialRows = new Map(), options = {}) {
   const listeners = new Map();
   const maintenance = [];
   const effects = { creates: 0, flushes: 0, queries: 0, compactions: 0 };
+  const settingValues = { enabled: true, threshold: 90, modelFilter: '', autoContinue: true, autoSwitch: true, ...options.config };
+  const config = Object.fromEntries(Object.keys(settingValues).map(key => [key, { get: () => settingValues[key] }]));
+  const routes = new Map();
+  const configEdits = [];
   let command;
   function makeAgent(id) {
     const queues = { 'next-turn': [], 'next-step': [] };
     const events = [];
+    let selection = { provider: 'test', model: 'test' };
     function splice(target, start, count, inserted, outcome) {
       const removed = queues[target].splice(start, count, ...inserted);
       events.push({ type: 'agent/inbox/spliced', data: { target, start, removedCount: count, inserted, ...(outcome ? { outcome } : {}) } });
@@ -55,10 +60,13 @@ async function harness(initialRows = new Map(), options = {}) {
       },
     };
     const agent = {
-      id, events, inbox, sent: [], wakes: [], status: 'idle',
+      id, events, inbox, sent: [], wakes: [], selections: [], replies: 90, status: 'idle',
       session: { header: { id }, surface: { nodes: [] } },
       ctx: { get: key => key === 'compaction' ? options.scopedCompaction : undefined },
-      model: { current: () => ({ provider: 'test', model: 'test' }), select() {} },
+      model: {
+        current: () => selection,
+        select(next) { selection = next; agent.selections.push(next); },
+      },
       whenIdle: async () => {},
       runMaintenance: task => {
         const promise = task(new AbortController().signal);
@@ -98,7 +106,9 @@ async function harness(initialRows = new Map(), options = {}) {
       for (const name of Object.keys(spec.tables)) assert.match(name, UNIT_NAME_RE);
       return { table: () => table, close: async () => {} };
     } },
-    sessionProjections: { register: async () => ({ stateOf: () => ({ replies: 90 }), dispose() {} }) },
+    sessionProjections: { register: async () => ({
+      stateOf: session => ({ replies: agents.get(session.header.id).replies }), dispose() {},
+    }) },
     sessionQuery: { observeSession: async id => {
       effects.queries++;
       return { events: agents.get(id).events, [Symbol.dispose]() {} };
@@ -110,7 +120,16 @@ async function harness(initialRows = new Map(), options = {}) {
     },
     workingDirectory: { get: () => '/project' },
     agentPresets: { presetForSession: () => null },
-    configEditor: { edit: async () => {} },
+    configEditor: { edit: async (_entry, change) => {
+      const next = change({ ...settingValues }, {});
+      configEdits.push(next);
+      Object.assign(settingValues, next);
+    } },
+    connection: { fetch: { register: spec => {
+      const key = spec.path + ':' + spec.methods.join(',');
+      routes.set(key, spec);
+      return () => routes.delete(key);
+    } } },
     fiber: { entry: 'test-entry' },
     commands: { register: spec => { command = spec.handler; } },
     tools: { register() {} },
@@ -118,13 +137,43 @@ async function harness(initialRows = new Map(), options = {}) {
     effect: setup => { setup(); },
     get: key => key === 'compaction' ? options.globalCompaction : undefined,
   };
-  await plugin.apply(ctx, plugin.Config({ enabled: true }));
+  await plugin.apply(ctx, config);
   return {
-    plugin, old, target, rows, agents, listeners, effects,
+    plugin, old, target, rows, agents, listeners, effects, routes, settingValues, configEdits,
+    settingsRequest: (method, body, contentType = 'application/json') => {
+      const route = routes.get('/api/session-relay/settings:GET,POST');
+      assert.ok(route, 'settings route is registered');
+      return route.fetch(new Request('http://localhost/api/session-relay/settings', {
+        method, ...(body === undefined ? {} : { headers: { 'content-type': contentType }, body: JSON.stringify(body) }),
+      }));
+    },
     command: rawInput => command({ agent: old, rawInput, signal: new AbortController().signal }),
     settle: async () => { await new Promise(setImmediate); await Promise.all(maintenance); },
   };
 }
+
+test('global settings route reads and persists partial updates without a session', { skip: !hasRuntime }, async () => {
+  const h = await harness();
+  const read = await h.settingsRequest('GET');
+  assert.equal(read.status, 200);
+  assert.deepEqual(await read.json(), { ok: true, value: h.settingValues });
+
+  const patch = { threshold: 73, modelFilter: 'vendor/model-a\nmodel-b' };
+  const saved = await h.settingsRequest('POST', patch);
+  assert.equal(saved.status, 200);
+  assert.deepEqual(await saved.json(), { ok: true, value: h.settingValues });
+  assert.deepEqual(h.settingValues, { enabled: true, threshold: 73, modelFilter: patch.modelFilter, autoContinue: true, autoSwitch: true });
+  assert.deepEqual(h.configEdits, [h.settingValues]);
+
+  const invalid = await h.settingsRequest('POST', { threshold: 1 });
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(await invalid.json(), { ok: false, error: 'threshold must be an integer from 2 to 10000' });
+  assert.equal(h.settingValues.threshold, 73);
+  assert.equal(h.configEdits.length, 1);
+  const wrongContentType = await h.settingsRequest('POST', { enabled: false }, 'text/plain');
+  assert.equal(wrongContentType.status, 415);
+  assert.equal(h.settingValues.enabled, true);
+});
 
 test('Host imports against installed DSH without requiring a global compaction service', { skip: !hasRuntime }, async () => {
   const plugin = await import('../index.js');
@@ -224,14 +273,72 @@ test('release restores claimed input even though its original inbox receipt alre
   assert.deepEqual(h.old.wakes, []);
 });
 
+async function addHistory(agent) {
+  const { Session } = await import('@deepseek-ai/dsh-session');
+  agent.session = Session.create(agent.id);
+  agent.session.append('user/message', msg('history'), { surfaceOp: 'append' });
+  agent.events = agent.session.snapshotEvents();
+}
+
+const signal = () => new AbortController().signal;
+
+test('adapter inherits an allowed model across two handoffs and does not wake after natural completion', { skip: !hasRuntime }, async () => {
+  const { AgentModel, modelSelectionProjectionDefinition } = await import('@deepseek-ai/dsh-agent');
+  const compacted = [];
+  const scopedCompaction = { compactRegion: async (_start, _end, agent) => { compacted.push(agent.id); return { summary }; } };
+  const selection = { provider: 'test-route', model: 'selected-model', reasoningEffort: 'high' };
+  const h = await harness(new Map(), { scopedCompaction, config: { threshold: 3, modelFilter: 'test-route/selected-model' } });
+  const preStep = (agent, modelSelection = agent.model.current()) => h.listeners.get('agent/pre-step')(
+    { agent, messages: [], signal: signal(), modelSelection }, async () => ({ kind: 'enter', messages: [] }),
+  );
+  const stopTurn = agent => h.listeners.get('agent/turn-stopping')({ agent, signal: signal() });
+
+  await addHistory(h.old);
+  h.old.model = new AgentModel(modelSelectionProjectionDefinition.init, h.old.session, selection);
+  assert.deepEqual(h.old.model.current(), selection);
+  h.old.replies = 2;
+  assert.deepEqual(await preStep(h.old), { kind: 'enter', messages: [] });
+  assert.equal(h.rows.size, 0);
+  h.old.replies = 3;
+  // A step keeps its captured route even if the current selection changed mid-boundary.
+  assert.deepEqual(await preStep(h.old, { ...selection, provider: 'other-route' }), { kind: 'enter', messages: [] });
+  assert.equal(h.rows.size, 0);
+  assert.deepEqual(await preStep(h.old), { kind: 'reject' });
+  await h.settle();
+  const firstHandoff = h.rows.get(h.old.id);
+  assert.equal(firstHandoff.phase, 'done');
+  assert.deepEqual(firstHandoff.selection, selection);
+  const second = h.agents.get(firstHandoff.targetId);
+  assert.notEqual(second.id, h.old.id);
+  assert.deepEqual(second.selections, [selection]);
+  assert.deepEqual(second.wakes, [firstHandoff.continueId]);
+  assert.deepEqual(second.inbox.nextTurn.map(item => item.id), [firstHandoff.seedId, firstHandoff.continueId]);
+
+  second.claim();
+  await addHistory(second);
+  second.replies = 2;
+  await stopTurn(second);
+  assert.equal(h.rows.has(second.id), false);
+  second.replies = 3;
+  await stopTurn(second);
+  await h.settle();
+  const secondHandoff = h.rows.get(second.id);
+  assert.equal(secondHandoff.phase, 'done');
+  assert.deepEqual(secondHandoff.selection, selection);
+  const third = h.agents.get(secondHandoff.targetId);
+  assert.equal(new Set([h.old.id, second.id, third.id]).size, 3);
+  assert.deepEqual(third.selections, [selection]);
+  assert.deepEqual(third.wakes, []);
+  assert.deepEqual(third.inbox.nextTurn.map(item => item.id), [secondHandoff.seedId]);
+  assert.deepEqual(compacted, [h.old.id, second.id]);
+  assert.equal(h.effects.creates, 2);
+});
+
 test('compression resolves the Agent-scoped service when no global service exists', { skip: !hasRuntime }, async () => {
   let calls = 0;
   const scopedCompaction = { compactRegion: async () => { calls++; return { summary }; } };
   const h = await harness(new Map(), { scopedCompaction });
-  const { Session } = await import('@deepseek-ai/dsh-session');
-  h.old.session = Session.create(h.old.id);
-  h.old.session.append('user/message', msg('history'), { surfaceOp: 'append' });
-  h.old.events = h.old.session.snapshotEvents();
+  await addHistory(h.old);
   const result = await h.listeners.get('agent/pre-step')({ agent: h.old, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [] }));
   await h.settle();
   assert.deepEqual(result, { kind: 'reject' });

@@ -5,6 +5,7 @@
   },
   "enabled": "启用自动接力",
   "threshold": "模型回复次数阈值",
+  "modelFilter": "触发接力的模型",
   "autoContinue": "自动继续未完成任务",
   "autoSwitch": "自动打开新会话"
 }

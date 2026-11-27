@@ -4,16 +4,29 @@ export const MIN_THRESHOLD = 2;
 export const MAX_THRESHOLD = 10000;
 
 export function validateSettings(patch) {
-  const allowed = new Set(['enabled', 'threshold', 'autoContinue', 'autoSwitch']);
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw new Error('Settings must be an object');
+  }
+  const allowed = new Set(['enabled', 'threshold', 'modelFilter', 'autoContinue', 'autoSwitch']);
   for (const key of Object.keys(patch)) {
     if (!allowed.has(key)) throw new Error(`Unknown setting: ${key}`);
     if (key === 'threshold') {
       if (!Number.isSafeInteger(patch[key]) || patch[key] < MIN_THRESHOLD || patch[key] > MAX_THRESHOLD) {
         throw new Error(`threshold must be an integer from ${MIN_THRESHOLD} to ${MAX_THRESHOLD}`);
       }
+    } else if (key === 'modelFilter') {
+      if (typeof patch[key] !== 'string') throw new Error('modelFilter must be a string');
     } else if (typeof patch[key] !== 'boolean') throw new Error(`${key} must be a boolean`);
   }
   return patch;
+}
+
+function matchesModel(filter, selection) {
+  const entries = (filter ?? '').split(/[,，\r\n]+/).map(entry => entry.trim()).filter(Boolean);
+  if (!entries.length) return true;
+  if (!selection?.model) return false;
+  return entries.includes(selection.model)
+    || (!!selection.provider && entries.includes(selection.provider + '/' + selection.model));
 }
 
 export function mergeMessages(...groups) {
@@ -79,7 +92,7 @@ export class SessionRelay {
   }
 
   /** Called only inside the old Agent's open turn, at a balanced boundary. */
-  async boundary(agent, messages, resume, signal) {
+  async boundary(agent, messages, resume, signal, modelSelection) {
     if (this.disposed || !this.a.eligible(agent)) return false;
     const existing = this.a.get(agent.id);
     if (existing) {
@@ -89,10 +102,12 @@ export class SessionRelay {
     }
     const config = this.a.settings();
     if (!config.enabled || this.a.count(agent) < config.threshold) return false;
+    const selection = modelSelection ?? this.a.selection(agent);
+    if (!matchesModel(config.modelFilter, selection)) return false;
     const row = {
       phase: 'compressing', createdAt: this.a.now(), targetId: this.a.id(),
       claimed: mergeMessages(messages), resume, seedId: this.a.id(), continueId: this.a.id(),
-      selection: this.a.selection(agent) ?? null, location: this.a.location(agent),
+      selection: selection ?? null, location: this.a.location(agent),
     };
     // Persist claimed inputs before rejecting their step. Failure propagates loudly.
     await this.a.put(agent.id, row);

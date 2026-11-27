@@ -5,6 +5,7 @@
   },
   "enabled": "Enable automatic relay",
   "threshold": "Model reply threshold",
+  "modelFilter": "Models that trigger relay",
   "autoContinue": "Resume unfinished tasks",
   "autoSwitch": "Open the new session automatically"
 }
